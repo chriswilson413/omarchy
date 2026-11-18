@@ -36,16 +36,18 @@ emit_image() {
   tmp=$(mktemp --tmpdir="$IMAGE_DIR" clipboard.XXXXXX) || return 0
   read_copy "$@" || return
 
-  hash=$(sha256sum "$tmp" | awk '{print $1}')
-  file="$IMAGE_DIR/$hash.$ext"
-  if [[ -e $file ]]; then
-    rm -f "$tmp"
-  else
-    mv "$tmp" "$file"
+  hash=$(sha256sum <"$tmp" | awk '{print $1}')
+  [[ $hash =~ ^[0-9a-f]{64}$ ]] || return 0
+  # Never reuse a path: detached cleanup may still be deleting an older capture.
+  file=$(mktemp --tmpdir="$IMAGE_DIR" "$hash.XXXXXX.$ext") || { rm -f "$tmp"; return 0; }
+  if ! mv "$tmp" "$file"; then
+    rm -f -- "$file"
+    return 0
   fi
+  tmp=""
 
   jq -cn --arg mime "$mime" --arg path "$file" --arg captured_at "$(LC_TIME="$(omarchy-language locale 2>/dev/null)" date +'%A %H:%M')" \
-    '{type:"image", mime:$mime, path:$path, capturedAt:$captured_at}'
+    '{type:"image", mime:$mime, path:$path, capturedAt:$captured_at}' || rm -f -- "$file"
 }
 
 emit_text() {

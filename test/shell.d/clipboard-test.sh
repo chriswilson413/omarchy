@@ -65,6 +65,16 @@ assertDeepEqual(
 assertDeepEqual(clipboard.removeEntryAt(history, 10), history, 'clipboard removeEntryAt ignores invalid indexes')
 assertDeepEqual(clipboard.clearHistory(), [], 'clipboard clearHistory returns an empty history')
 
+const historyAtLimit = [
+  { type: 'image', path: '/tmp/new.png', mime: 'image/png' },
+  { type: 'image', path: '/tmp/old.png', mime: 'image/png' }
+]
+assertDeepEqual(
+  clipboard.prunedImagePaths(historyAtLimit, clipboard.addEntry(historyAtLimit, { type: 'text', text: 'new text' }, 2)),
+  ['/tmp/old.png'],
+  'clipboard prunedImagePaths returns image paths evicted by history limit'
+)
+
 assertDeepEqual(
   clipboard.displayRows(history, 'image', 50).map(row => ({ type: row.entryType, preview: row.previewText, mime: row.mime })),
   [{ type: 'image', preview: 'Image', mime: 'image/png' }],
@@ -433,3 +443,107 @@ OMASNAP_OUT="$TMPDIR/omasnap" HOME="$TMPDIR/home" PATH="$TMPDIR/bin:$PATH" \
 
 [[ $(<"$TMPDIR/omasnap") == "--notify $TMPDIR/image.png" ]] || fail "clipboard open helper opens image entries in Omasnap"
 pass "clipboard open helper opens image entries in Omasnap"
+
+# The sweep removes aged capture files the history doesn't list, and nothing else.
+SWEEP_DIR="$TMPDIR/sweep-images"
+SWEEP_HIST="$TMPDIR/sweep-hist.json"
+mkdir -p "$SWEEP_DIR"
+orphan="$SWEEP_DIR/$(printf 'a%.0s' {1..64}).png"
+leftover="$SWEEP_DIR/clipboard.Xy34Zw"
+listed="$SWEEP_DIR/$(printf 'b%.0s' {1..64}).Ab12Cd.png"
+listed_by_kind="$SWEEP_DIR/$(printf 'c%.0s' {1..64}).png"
+recent="$SWEEP_DIR/$(printf 'd%.0s' {1..64}).png"
+foreign="$SWEEP_DIR/notes.txt"
+
+reset_sweep_fixture() {
+  touch -d '2 minutes ago' "$orphan" "$leftover" "$listed" "$listed_by_kind" "$foreign"
+  touch "$recent"
+}
+
+run_sweep() {
+  "$ROOT/shell/plugins/clipboard/sweep-images.sh" "$SWEEP_DIR" "$SWEEP_HIST"
+}
+
+reset_sweep_fixture
+printf '[{"type":"image","path":"%s"},{"type":0,"kind":"image","path":"%s"}]\n' "$listed" "$listed_by_kind" >"$SWEEP_HIST"
+run_sweep
+[[ ! -e $orphan && ! -e $leftover ]] || fail "sweep removes aged capture files the history doesn't list"
+[[ -f $listed && -f $listed_by_kind && -f $recent && -f $foreign ]] || fail "sweep keeps listed, recent and foreign files"
+pass "clipboard orphan sweep removes only aged capture files the history doesn't list"
+
+# A history that is missing or isn't one JSON array may still list every image.
+for unreadable in missing '' ' ' '[{"type":"image","path":' '[] []' '[NaN]'; do
+  reset_sweep_fixture
+  if [[ $unreadable == "missing" ]]; then
+    rm -f "$SWEEP_HIST"
+  else
+    printf '%s' "$unreadable" >"$SWEEP_HIST"
+  fi
+  run_sweep
+  [[ -f $orphan ]] || fail "sweep keeps every image when the history reads '$unreadable'"
+done
+pass "clipboard orphan sweep keeps every image when the history can't be read"
+
+# Given the images the shell just dropped, only those go, however new, once the history no longer lists them,
+# and the ones it keeps are printed for the shell to offer again.
+reset_sweep_fixture
+outside="$TMPDIR/$(printf 'e%.0s' {1..64}).png"
+touch -d '2 minutes ago' "$outside"
+printf '[{"type":"image","path":"%s"}]\n' "$listed" >"$SWEEP_HIST"
+kept=$("$ROOT/shell/plugins/clipboard/sweep-images.sh" "$SWEEP_DIR" "$SWEEP_HIST" "$recent" "$listed" "$outside")
+[[ ! -e $recent && -f $listed && -f $outside && -f $orphan ]] || fail "sweep deletes only the given images the history no longer lists"
+[[ $kept == "$listed" ]] || fail "sweep prints the given images the history still lists"
+printf '[' >"$SWEEP_HIST"
+kept=$("$ROOT/shell/plugins/clipboard/sweep-images.sh" "$SWEEP_DIR" "$SWEEP_HIST" "$listed")
+[[ -f $listed && $kept == "$listed" ]] || fail "sweep prints the given images it keeps when the history can't be read"
+pass "clipboard sweep deletes only the given images the history no longer lists"
+
+cat >"$TMPDIR/bin/wl-paste" <<'SH'
+#!/bin/bash
+if [[ $1 == "--list-types" ]]; then
+  printf 'image/png\n'
+fi
+SH
+
+# Identical captures own separate files, even before the new history is saved.
+capture_image() {
+  printf 'recaptured-image' | XDG_STATE_HOME="$TMPDIR/state with spaces" PATH="$TMPDIR/bin:$PATH" "$ROOT/shell/plugins/clipboard/capture.sh" image/png
+}
+old_capture=$(capture_image)
+old_path=$(jq -r .path <<<"$old_capture")
+new_capture=$(capture_image)
+new_path=$(jq -r .path <<<"$new_capture")
+[[ $old_path != "$new_path" && -s $old_path && -s $new_path ]] || fail "identical captures have distinct existing paths"
+OLD_CAPTURE="$old_capture" NEW_CAPTURE="$new_capture" run_node_test <<'JS'
+const clipboard = requireFromRoot('shell/plugins/clipboard/ClipboardHistory.js')
+const oldEntry = JSON.parse(process.env.OLD_CAPTURE)
+const newEntry = clipboard.normalizeEntry(JSON.parse(process.env.NEW_CAPTURE))
+const next = clipboard.addEntry([oldEntry], newEntry)
+assertDeepEqual(next, [newEntry], 'identical captures deduplicate by content')
+assertDeepEqual(clipboard.prunedImagePaths([oldEntry], next), [oldEntry.path], 'duplicate replacement prunes the previous path')
+const legacy = { ...oldEntry, path: oldEntry.path.replace(/\.[A-Za-z0-9]{6}\.png$/, '.png') }
+assertDeepEqual(clipboard.addEntry([legacy], newEntry), [newEntry], 'legacy hash-only captures deduplicate with fresh captures')
+JS
+
+# The plugin itself, never shown, with the clipboard and the session's watchers stubbed out.
+require_quickshell "clipboard image cleanup in a running plugin"
+qml_fixture_scratch
+trap 'rm -rf "$TMPDIR"; qml_fixture_cleanup' EXIT
+printf '#!/bin/bash\nexit 1\n' >"$QML_FIXTURE_TMP/bin/pkill"
+printf '#!/bin/bash\nfor arg; do [[ $arg == --watch ]] && exec sleep infinity; done\nexit 1\n' >"$QML_FIXTURE_TMP/bin/wl-paste"
+chmod +x "$QML_FIXTURE_TMP/bin/pkill" "$QML_FIXTURE_TMP/bin/wl-paste"
+fixture_state="$QML_FIXTURE_TMP/home/.local/state/omarchy"
+mkdir -p "$fixture_state/clipboard-images"
+image_a="$fixture_state/clipboard-images/$(printf 'a%.0s' {1..64}).Aaaaaa.png"
+image_b="$fixture_state/clipboard-images/$(printf 'b%.0s' {1..64}).Bbbbbb.png"
+recopy_b="$fixture_state/clipboard-images/$(printf 'b%.0s' {1..64}).Cccccc.png"
+orphan_image="$fixture_state/clipboard-images/$(printf 'c%.0s' {1..64}).png"
+# A is old enough for the sweep and kept only because it is listed; B and its
+# recopy are too new for it, so only the queue can delete them.
+touch -d '2 minutes ago' "$image_a" "$orphan_image"
+touch "$image_b" "$recopy_b"
+jq -n --arg a "$image_a" --arg b "$image_b" \
+  '[{type: "image", path: $a, mime: "image/png"}, {type: "image", path: $b, mime: "image/png"}, {type: "text", text: "hello"}]' \
+  >"$fixture_state/clipboard-history.json"
+CLIPBOARD_IMAGE_A="$image_a" CLIPBOARD_IMAGE_B="$image_b" CLIPBOARD_RECOPY_B="$recopy_b" CLIPBOARD_ORPHAN="$orphan_image" \
+  run_qml_fixture clipboard-image-cleanup "clipboard deletes an image only once the history on disk drops it" Ui Commons plugins

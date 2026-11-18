@@ -17,9 +17,14 @@ Item {
   property bool cursorActive: false
   property bool clearConfirmOpen: false
   property var history: []
+  property var pendingImageDeletes: []
+  property bool imageDeletesAfterRun: false
 
   property string historyPath: Quickshell.env("HOME") + "/.local/state/omarchy/clipboard-history.json"
+  // capture.sh saves images under $XDG_STATE_HOME, which the history has never followed.
+  property string imagesDir: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy/clipboard-images"
   property string captureScript: root.omarchyPath + "/shell/plugins/clipboard/capture.sh"
+  property string sweepScript: root.omarchyPath + "/shell/plugins/clipboard/sweep-images.sh"
   // Shares the [menu] surface tokens — themes that style the menu also
   // style the clipboard. Selected-row colors composed in the
   // singleton so consumers drop them straight into Rectangle bindings.
@@ -77,11 +82,49 @@ Item {
     historyFile.setText(JSON.stringify(root.history.slice(0, root.historyLimit), null, 2) + "\n")
   }
 
+  // Image files wait for the history that drops them to be saved, and then go
+  // only if the history file on disk no longer lists them: saved() also fires
+  // for a write that was replaced or whose commit failed. Whatever is still
+  // listed comes back into the queue for the next save, as after a failed one.
+  function deleteImageFiles(paths) {
+    if (!paths || paths.length === 0) return
+    var queued = []
+    var prefix = root.imagesDir + "/"
+    for (var i = 0; i < paths.length; i++) {
+      var p = String(paths[i] || "")
+      var name = p.substring(prefix.length)
+      if (p.indexOf(prefix) === 0 && name.length > 0 && name.indexOf("/") === -1 && name !== "." && name !== "..") {
+        queued.push(p)
+      }
+    }
+    if (queued.length > 0) root.pendingImageDeletes = root.pendingImageDeletes.concat(queued)
+  }
+
+  function flushImageDeletes() {
+    if (imageDeleteProc.running) {
+      root.imageDeletesAfterRun = true
+      return
+    }
+    if (root.pendingImageDeletes.length === 0) return
+    var paths = root.pendingImageDeletes
+    root.pendingImageDeletes = []
+    // Capture paths are never reused, so delayed deletion cannot remove a recapture.
+    imageDeleteProc.command = [root.sweepScript, root.imagesDir, root.historyPath].concat(paths)
+    imageDeleteProc.running = true
+  }
+
+  function sweepOrphanImages() {
+    // Fresh capture paths also protect against a sweep that already selected an orphan.
+    Quickshell.execDetached([root.sweepScript, root.imagesDir, root.historyPath])
+  }
+
   function addClipboardEntry(entry) {
     var normalized = ClipboardHistory.normalizeEntry(entry)
     if (!normalized) return
 
+    var oldHistory = root.history
     root.history = ClipboardHistory.addEntry(root.history, normalized, root.historyLimit)
+    root.deleteImageFiles(ClipboardHistory.prunedImagePaths(oldHistory, root.history))
     root.saveHistory()
     if (root.opened) root.rebuildDisplay()
   }
@@ -103,8 +146,11 @@ Item {
   }
 
   function confirmClearHistory() {
+    var oldHistory = root.history
     root.history = ClipboardHistory.clearHistory()
+    root.deleteImageFiles(ClipboardHistory.prunedImagePaths(oldHistory, root.history))
     root.saveHistory()
+    root.sweepOrphanImages()
     root.selectedIndex = 0
     root.cursorActive = false
     root.disarmPointer()
@@ -117,7 +163,9 @@ Item {
     if (index < 0 || index >= displayModel.count) return
 
     var row = displayModel.get(index)
+    var oldHistory = root.history
     root.history = ClipboardHistory.removeEntryAt(root.history, row.historyIndex)
+    root.deleteImageFiles(ClipboardHistory.prunedImagePaths(oldHistory, root.history))
     root.saveHistory()
 
     if (displayModel.count <= 1) {
@@ -255,6 +303,22 @@ Item {
     referenceItem: card
   }
 
+  // Prints the images it kept because the history on disk still lists them.
+  Process {
+    id: imageDeleteProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var kept = text.split("\n").filter(function(path) { return path.length > 0 })
+        if (kept.length > 0) root.pendingImageDeletes = kept.concat(root.pendingImageDeletes)
+      }
+    }
+    onExited: {
+      if (!root.imageDeletesAfterRun) return
+      root.imageDeletesAfterRun = false
+      root.flushImageDeletes()
+    }
+  }
+
   FileView {
     id: historyFile
     path: root.historyPath
@@ -264,6 +328,7 @@ Item {
     onLoaded: root.loadHistory(text())
     onLoadFailed: root.loadHistory("[]")
     onFileChanged: reload()
+    onSaved: root.flushImageDeletes()
   }
 
   // Reap watchers left behind by a previous shell instance, then start our
@@ -276,6 +341,7 @@ Item {
       currentProc.running = true
       textWatchProc.running = true
       imageWatchProc.running = true
+      root.sweepOrphanImages()
     }
   }
 
